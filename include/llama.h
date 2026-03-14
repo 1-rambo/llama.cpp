@@ -758,6 +758,13 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Returns currently allocated context memory size in bytes (KV / recurrent cache buffers).
+    // This is a real allocated size, not an estimate.
+    LLAMA_API size_t llama_context_memory_size_context(const struct llama_context * ctx);
+
+    // Returns currently allocated total memory size in bytes (model + context + compute buffers).
+    LLAMA_API size_t llama_context_memory_size_total(const struct llama_context * ctx);
+
     //
     // State / sessions
     //

@@ -3301,6 +3301,32 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+size_t llama_context_memory_size_context(const struct llama_context * ctx) {
+    if (!ctx) {
+        return 0;
+    }
+
+    size_t total = 0;
+    for (const auto & entry : ctx->memory_breakdown()) {
+        total += entry.second.context;
+    }
+
+    return total;
+}
+
+size_t llama_context_memory_size_total(const struct llama_context * ctx) {
+    if (!ctx) {
+        return 0;
+    }
+
+    size_t total = 0;
+    for (const auto & entry : ctx->memory_breakdown()) {
+        total += entry.second.total();
+    }
+
+    return total;
+}
+
 // llama state API
 
 // deprecated
