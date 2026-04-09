@@ -3,6 +3,7 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <cmath>
 #include <ctime>
 #include <limits>
 #include <stdexcept>
@@ -38,6 +39,7 @@ llama_chat_tree_node & llama_chat_tree::require_node(int32_t node_id) {
 
 void llama_chat_tree::reset_state() {
     nodes_.clear();
+    archived_nodes_.clear();
 
     llama_chat_tree_node root;
     root.id = 0;
@@ -58,6 +60,323 @@ void llama_chat_tree::reset_state() {
     last_pruned_node_ids_.clear();
     last_pruned_at_s_ = 0;
     initialized_ = true;
+}
+
+void llama_chat_tree::set_tier_config(const llama_chat_tree_tier_config & config) {
+    tier_config_ = config;
+}
+
+void llama_chat_tree::tier_reset() {
+    tier_slots_.clear();
+    tier_access_tick_ = 0;
+    tier_stats_ = llama_chat_tree_tier_stats{};
+}
+
+void llama_chat_tree::tier_on_slot_saved(int32_t slot_id, int32_t token_count) {
+    if (slot_id < 1) {
+        return;
+    }
+
+    tier_slot_meta meta;
+    auto it = tier_slots_.find(slot_id);
+    if (it != tier_slots_.end()) {
+        meta = it->second;
+    }
+
+    tier_access_tick_++;
+    meta.token_count = std::max(0, token_count);
+    meta.level = LLAMA_CHAT_TREE_CACHE_TIER_L1;
+    meta.last_access_tick = tier_access_tick_;
+    meta.access_count = std::max(1, meta.access_count + 1);
+    tier_slots_[slot_id] = meta;
+}
+
+void llama_chat_tree::tier_on_slot_removed(int32_t slot_id) {
+    tier_slots_.erase(slot_id);
+}
+
+void llama_chat_tree::tier_on_slot_restored(int32_t slot_id, int32_t token_count) {
+    if (slot_id < 1) {
+        return;
+    }
+
+    auto & meta = tier_slots_[slot_id];
+    tier_access_tick_++;
+    meta.token_count = std::max(0, token_count);
+    if (meta.level != LLAMA_CHAT_TREE_CACHE_TIER_L1) {
+        tier_stats_.promotions++;
+    }
+    meta.level = LLAMA_CHAT_TREE_CACHE_TIER_L1;
+    meta.last_access_tick = tier_access_tick_;
+    meta.access_count = std::max(1, meta.access_count + 1);
+}
+
+void llama_chat_tree::tier_on_disk_read() {
+    tier_stats_.disk_reads++;
+}
+
+void llama_chat_tree::tier_on_disk_write() {
+    tier_stats_.disk_writes++;
+}
+
+void llama_chat_tree::tier_on_l3_overflow() {
+    tier_stats_.l3_overflow_events++;
+}
+
+void llama_chat_tree::tier_on_restore_attempt() {
+    tier_stats_.restore_attempts++;
+}
+
+void llama_chat_tree::tier_on_restore_hit(int32_t level) {
+    if (level == LLAMA_CHAT_TREE_CACHE_TIER_L1) {
+        tier_stats_.restore_hits_l1++;
+        return;
+    }
+    if (level == LLAMA_CHAT_TREE_CACHE_TIER_L2) {
+        tier_stats_.restore_hits_l2++;
+        return;
+    }
+    if (level == LLAMA_CHAT_TREE_CACHE_TIER_L3) {
+        tier_stats_.restore_hits_l3++;
+    }
+}
+
+void llama_chat_tree::tier_on_restore_miss() {
+    tier_stats_.restore_misses++;
+}
+
+void llama_chat_tree::tier_on_restore_rebuild() {
+    tier_stats_.restore_rebuilds++;
+}
+
+void llama_chat_tree::tier_on_slot_alloc_hit() {
+    tier_stats_.slot_alloc_hits++;
+}
+
+void llama_chat_tree::tier_on_slot_alloc_miss() {
+    tier_stats_.slot_alloc_misses++;
+}
+
+void llama_chat_tree::tier_on_slot_evict(int32_t level) {
+    if (level == LLAMA_CHAT_TREE_CACHE_TIER_L1) {
+        tier_stats_.slot_evict_l1++;
+        return;
+    }
+    if (level == LLAMA_CHAT_TREE_CACHE_TIER_L2) {
+        tier_stats_.slot_evict_l2++;
+        return;
+    }
+    if (level == LLAMA_CHAT_TREE_CACHE_TIER_L3) {
+        tier_stats_.slot_evict_l3++;
+    }
+}
+
+void llama_chat_tree::tier_on_fallback_replay() {
+    tier_stats_.fallback_replays++;
+}
+
+int32_t llama_chat_tree::tier_slot_level(int32_t slot_id) const {
+    auto it = tier_slots_.find(slot_id);
+    if (it == tier_slots_.end()) {
+        return -1;
+    }
+    return it->second.level;
+}
+
+bool llama_chat_tree::tier_set_slot_level(int32_t slot_id, int32_t level) {
+    auto it = tier_slots_.find(slot_id);
+    if (it == tier_slots_.end()) {
+        return false;
+    }
+
+    const int32_t old_level = it->second.level;
+
+    if (old_level != level) {
+        if (old_level > level) {
+            tier_stats_.promotions++;
+        } else {
+            tier_stats_.demotions++;
+        }
+    }
+
+    tier_access_tick_++;
+    it->second.level = level;
+    it->second.last_access_tick = tier_access_tick_;
+    if (old_level == level || old_level > level) {
+        it->second.access_count = std::max(1, it->second.access_count + 1);
+    }
+    return true;
+}
+
+int32_t llama_chat_tree::tier_slot_token_count(int32_t slot_id) const {
+    auto it = tier_slots_.find(slot_id);
+    if (it == tier_slots_.end()) {
+        return 0;
+    }
+    return std::max(0, it->second.token_count);
+}
+
+int32_t llama_chat_tree::tier_total_tokens(int32_t level) const {
+    int64_t total = 0;
+    for (const auto & entry : tier_slots_) {
+        if (entry.second.level != level) {
+            continue;
+        }
+        total += std::max(0, entry.second.token_count);
+    }
+    return total > std::numeric_limits<int32_t>::max()
+        ? std::numeric_limits<int32_t>::max()
+        : static_cast<int32_t>(total);
+}
+
+int32_t llama_chat_tree::tier_total_slots(int32_t level) const {
+    int32_t total = 0;
+    for (const auto & entry : tier_slots_) {
+        if (entry.second.level == level) {
+            total++;
+        }
+    }
+    return total;
+}
+
+int32_t llama_chat_tree::tier_pick_victim_slot(int32_t level, int32_t excluded_slot) const {
+    const int64_t now_tick = std::max<int64_t>(1, tier_access_tick_);
+
+    std::vector<int32_t> candidates;
+    candidates.reserve(tier_slots_.size());
+    for (const auto & entry : tier_slots_) {
+        const int32_t slot_id = entry.first;
+        if (slot_id == excluded_slot || entry.second.level != level) {
+            continue;
+        }
+        candidates.push_back(slot_id);
+    }
+    if (candidates.empty()) {
+        return -1;
+    }
+
+    if (tier_config_.replacement_policy == LLAMA_CHAT_TREE_REPLACEMENT_RANDOM) {
+        const uint64_t seed =
+            static_cast<uint64_t>(now_tick) * 1103515245ULL +
+            static_cast<uint64_t>(std::max(0, level)) * 12345ULL +
+            static_cast<uint64_t>(candidates.size()) * 2654435761ULL;
+        const size_t idx = static_cast<size_t>(seed % std::max<size_t>(1, candidates.size()));
+        return candidates[idx];
+    }
+
+    if (tier_config_.replacement_policy == LLAMA_CHAT_TREE_REPLACEMENT_LRU) {
+        int32_t best_slot = -1;
+        int64_t best_tick = std::numeric_limits<int64_t>::max();
+        int32_t best_tokens = -1;
+        for (const int32_t slot_id : candidates) {
+            const auto & meta = tier_slots_.at(slot_id);
+            const int64_t tick = meta.last_access_tick;
+            const int32_t tokens = std::max(0, meta.token_count);
+            if (tick < best_tick || (tick == best_tick && tokens > best_tokens)) {
+                best_tick = tick;
+                best_tokens = tokens;
+                best_slot = slot_id;
+            }
+        }
+        return best_slot;
+    }
+
+    if (tier_config_.replacement_policy == LLAMA_CHAT_TREE_REPLACEMENT_LFU) {
+        int32_t best_slot = -1;
+        int32_t best_freq = std::numeric_limits<int32_t>::max();
+        int64_t best_tick = std::numeric_limits<int64_t>::max();
+        int32_t best_tokens = -1;
+        for (const int32_t slot_id : candidates) {
+            const auto & meta = tier_slots_.at(slot_id);
+            const int32_t freq = std::max(1, meta.access_count);
+            const int64_t tick = meta.last_access_tick;
+            const int32_t tokens = std::max(0, meta.token_count);
+            if (freq < best_freq ||
+                (freq == best_freq && tick < best_tick) ||
+                (freq == best_freq && tick == best_tick && tokens > best_tokens)) {
+                best_freq = freq;
+                best_tick = tick;
+                best_tokens = tokens;
+                best_slot = slot_id;
+            }
+        }
+        return best_slot;
+    }
+
+    if (tier_config_.replacement_policy == LLAMA_CHAT_TREE_REPLACEMENT_SIZE_ONLY) {
+        int32_t best_slot = -1;
+        int32_t best_tokens = -1;
+        int64_t best_tick = std::numeric_limits<int64_t>::max();
+        for (const int32_t slot_id : candidates) {
+            const auto & meta = tier_slots_.at(slot_id);
+            const int32_t tokens = std::max(0, meta.token_count);
+            const int64_t tick = meta.last_access_tick;
+            if (tokens > best_tokens || (tokens == best_tokens && tick < best_tick)) {
+                best_tokens = tokens;
+                best_tick = tick;
+                best_slot = slot_id;
+            }
+        }
+        return best_slot;
+    }
+
+    // Size normalization uses configured tier cap when available.
+    // If cap is unset, fall back to observed max token count in this level.
+    const int32_t configured_cap =
+        level == LLAMA_CHAT_TREE_CACHE_TIER_L1 ? std::max(0, tier_config_.l1_token_cap) :
+        level == LLAMA_CHAT_TREE_CACHE_TIER_L2 ? std::max(0, tier_config_.l2_token_cap) :
+        level == LLAMA_CHAT_TREE_CACHE_TIER_L3 ? std::max(0, tier_config_.l3_token_cap) : 0;
+
+    int32_t observed_max_tokens = 1;
+    if (configured_cap <= 0) {
+        for (const auto & entry : tier_slots_) {
+            if (entry.second.level != level) {
+                continue;
+            }
+            observed_max_tokens = std::max(observed_max_tokens, std::max(1, entry.second.token_count));
+        }
+    }
+    const double size_scale = static_cast<double>(configured_cap > 0 ? configured_cap : observed_max_tokens);
+
+    double best_score = -1.0;
+    int32_t best_slot = -1;
+    for (const int32_t slot_id : candidates) {
+        const auto & entry = tier_slots_.at(slot_id);
+
+        const int64_t age = std::max<int64_t>(1, now_tick - entry.last_access_tick);
+        const double token_count = static_cast<double>(std::max(1, entry.token_count));
+        const double access_count = static_cast<double>(std::max(1, entry.access_count));
+
+        // Monotonic and scale-stable score:
+        // - higher age => more evictable (log1p smooths very old outliers)
+        // - larger token footprint => more evictable (normalized by tier capacity)
+        // - higher access count => less evictable
+        const double age_term = std::log1p(static_cast<double>(age));
+        const double size_term = token_count / std::max(1.0, size_scale);
+        const double freq_term = std::log1p(access_count);
+        const double score = (age_term * (1.0 + size_term)) / (1.0 + freq_term);
+        if (score > best_score) {
+            best_score = score;
+            best_slot = slot_id;
+            continue;
+        }
+
+        if (score == best_score && best_slot >= 0) {
+            const auto & best_meta = tier_slots_.at(best_slot);
+            if (entry.last_access_tick < best_meta.last_access_tick) {
+                best_slot = slot_id;
+                continue;
+            }
+            if (entry.last_access_tick == best_meta.last_access_tick &&
+                entry.token_count > best_meta.token_count) {
+                best_slot = slot_id;
+            }
+        }
+        if (best_slot < 0) {
+            best_slot = slot_id;
+        }
+    }
+    return best_slot;
 }
 
 void llama_chat_tree::refresh_context_memory() {
@@ -141,6 +460,7 @@ bool llama_chat_tree::delete_leaf_node(int32_t node_id, std::string & err) {
     }
 
     const int32_t parent_id = node.parent_id;
+    archive_node(node);
     nodes_.erase(node_id);
 
     if (parent_id >= 0) {
@@ -154,6 +474,158 @@ bool llama_chat_tree::delete_leaf_node(int32_t node_id, std::string & err) {
     return true;
 }
 
+void llama_chat_tree::archive_node(const llama_chat_tree_node & node) {
+    if (node.id == root_id_) {
+        return;
+    }
+    archived_node_meta meta;
+    meta.id = node.id;
+    meta.parent_id = node.parent_id;
+    meta.user_text = node.user_text;
+    meta.assistant_text = node.assistant_text;
+    meta.status = node.status;
+    meta.prefix_token_count = node.prefix_token_count;
+    meta.generation_time_ms = node.generation_time_ms;
+    meta.cached_token_count = node.cached_token_count;
+    meta.snapshot_token_bytes = node.snapshot_token_bytes;
+    archived_nodes_[node.id] = std::move(meta);
+}
+
+bool llama_chat_tree::recover_parent_chain(int32_t node_id, std::string & err) {
+    if (node_id == root_id_) {
+        return true;
+    }
+    if (find_node(node_id)) {
+        return true;
+    }
+
+    std::vector<archived_node_meta> chain;
+    int32_t cursor = node_id;
+    while (find_node(cursor) == nullptr) {
+        const auto it = archived_nodes_.find(cursor);
+        if (it == archived_nodes_.end()) {
+            err = "Tree node not found and no archived lineage: " + std::to_string(cursor);
+            return false;
+        }
+        chain.push_back(it->second);
+        if (it->second.parent_id < 0) {
+            break;
+        }
+        cursor = it->second.parent_id;
+    }
+
+    if (chain.empty()) {
+        err = "Tree recover chain is empty for node: " + std::to_string(node_id);
+        return false;
+    }
+
+    int32_t current_parent = chain.back().parent_id;
+    if (current_parent < 0) {
+        current_parent = root_id_;
+    }
+    if (!find_node(current_parent)) {
+        err = "Tree recover anchor not found: " + std::to_string(current_parent);
+        return false;
+    }
+
+    const int32_t t = now_s();
+    for (int i = (int)chain.size() - 1; i >= 0; --i) {
+        const archived_node_meta & meta = chain[(size_t)i];
+        if (find_node(meta.id)) {
+            current_parent = meta.id;
+            continue;
+        }
+
+        llama_chat_tree_node restored;
+        restored.id = meta.id;
+        restored.parent_id = current_parent;
+        restored.user_text = meta.user_text;
+        restored.assistant_text = meta.assistant_text;
+        restored.status = "cached";
+        restored.prefix_token_count = std::max(0, meta.prefix_token_count);
+        restored.generation_time_ms = std::max(0, meta.generation_time_ms);
+        restored.cached_token_count = std::max(0, meta.cached_token_count);
+        restored.snapshot_token_bytes = std::max(0, meta.snapshot_token_bytes);
+        restored.created_at_s = t;
+        restored.last_accessed_at_s = t;
+
+        nodes_[restored.id] = restored;
+        auto & parent = require_node(current_parent);
+        if (std::find(parent.child_ids.begin(), parent.child_ids.end(), restored.id) == parent.child_ids.end()) {
+            parent.child_ids.push_back(restored.id);
+        }
+        if (next_id_ <= restored.id) {
+            next_id_ = restored.id + 1;
+        }
+        current_parent = restored.id;
+    }
+
+    touch_path(current_parent);
+    update_ancestor_cache_count(current_parent);
+    refresh_totals();
+    return find_node(node_id) != nullptr;
+}
+
+bool llama_chat_tree::should_prune_leaf(const llama_chat_tree_node & node) const {
+    if (!tier_config_.enabled) {
+        return true;
+    }
+
+    // Tiered mode fallback: prefer preserving cache unless L3 over-cap handling
+    // or memory-cap pressure forces pruning.
+    auto it = tier_slots_.find(node.id);
+    if (it == tier_slots_.end()) {
+        return true;
+    }
+
+    if (it->second.level != LLAMA_CHAT_TREE_CACHE_TIER_L3) {
+        return false;
+    }
+
+    return should_force_prune_l3_over_cap(node);
+}
+
+bool llama_chat_tree::should_prune_on_l1_l2_boundary(const llama_chat_tree_node & node) const {
+    if (!tier_config_.enabled) {
+        return true;
+    }
+    const int32_t threshold = std::max(0, tier_config_.prune_l1_l2_token_threshold);
+    if (threshold <= 0) {
+        return false;
+    }
+    const int32_t token_count = std::max(0, node.prefix_token_count);
+    return token_count >= threshold;
+}
+
+bool llama_chat_tree::should_prune_on_l2_l3_boundary(const llama_chat_tree_node & node) const {
+    if (!tier_config_.enabled) {
+        return true;
+    }
+    const int32_t threshold = std::max(0, tier_config_.prune_l2_l3_token_threshold);
+    if (threshold <= 0) {
+        return false;
+    }
+    const int32_t token_count = std::max(0, node.prefix_token_count);
+    return token_count >= threshold;
+}
+
+bool llama_chat_tree::should_force_prune_l3_over_cap(const llama_chat_tree_node & node) const {
+    if (!tier_config_.enabled) {
+        return true;
+    }
+
+    // L3 over-cap has no lower tier to demote to; prune is the only option.
+    auto it = tier_slots_.find(node.id);
+    if (it == tier_slots_.end()) {
+        return true;
+    }
+    if (it->second.level != LLAMA_CHAT_TREE_CACHE_TIER_L3) {
+        return false;
+    }
+
+    return true;
+}
+
 void llama_chat_tree::prune_to_memory_cap(std::vector<int32_t> & pruned_node_ids) {
     while (total_snapshot_token_bytes_ > memory_cap_bytes_) {
         std::vector<llama_chat_tree_node *> leaf_candidates;
@@ -162,7 +634,7 @@ void llama_chat_tree::prune_to_memory_cap(std::vector<int32_t> & pruned_node_ids
             if (node.id == root_id_ || node.id == active_node_id_) {
                 continue;
             }
-            if (node.child_ids.empty()) {
+            if (node.child_ids.empty() && should_prune_leaf(node)) {
                 leaf_candidates.push_back(&node);
             }
         }
@@ -191,11 +663,13 @@ void llama_chat_tree::prune_to_memory_cap(std::vector<int32_t> & pruned_node_ids
 void llama_chat_tree::init(int32_t memory_cap_bytes) {
     memory_cap_bytes_ = memory_cap_bytes;
     reset_state();
+    tier_reset();
     refresh_totals();
 }
 
 void llama_chat_tree::reset() {
     reset_state();
+    tier_reset();
     refresh_totals();
 }
 
@@ -333,6 +807,10 @@ bool llama_chat_tree::delete_node(int32_t node_id, std::vector<int32_t> & delete
     }
 
     for (int32_t id : deleted_node_ids) {
+        auto it = nodes_.find(id);
+        if (it != nodes_.end()) {
+            archive_node(it->second);
+        }
         nodes_.erase(id);
     }
 
@@ -362,6 +840,18 @@ bool llama_chat_tree::chat_start(int32_t parent_id, const std::string & user_tex
     }
 
     return prepare_turn(parent_id, user_text, node_id, err);
+}
+
+bool llama_chat_tree::chat_recover_parent(int32_t node_id, std::string & err) {
+    ensure_initialized_for_chat();
+    tier_stats_.parent_recover_attempts++;
+    const bool ok = recover_parent_chain(node_id, err);
+    if (ok) {
+        tier_stats_.parent_recover_successes++;
+    } else {
+        tier_stats_.parent_recover_failures++;
+    }
+    return ok;
 }
 
 bool llama_chat_tree::chat_finish(

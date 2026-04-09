@@ -76,7 +76,10 @@
 #define WEBGPU_MUL_MAT_WG_SIZE               256
 #define WEBGPU_NUM_PARAM_BUFS                32u
 #define WEBGPU_COMMAND_SUBMIT_BATCH_SIZE     8u
-#define WEBGPU_WAIT_ANY_TIMEOUT_MS           0
+#define WEBGPU_WAIT_LONG_BLOCK_LOG_MS        2000
+#define WEBGPU_POOL_WAIT_SLICE_MS            200
+#define WEBGPU_POOL_OVERFLOW_AFTER_MS        1200
+#define WEBGPU_POOL_MAX_OVERFLOW_BUFS        8u
 // Maximum number of in-flight submissions per-thread, to avoid exhausting the parameter buffer pool
 #define WEBGPU_MAX_INFLIGHT_SUBS_PER_THREAD  WEBGPU_NUM_PARAM_BUFS / WEBGPU_COMMAND_SUBMIT_BATCH_SIZE
 #define WEBGPU_PARAMS_BUF_SIZE_BYTES         128  // enough for 32 parameters
@@ -136,6 +139,7 @@ static void ggml_webgpu_create_buffer(wgpu::Device &    device,
 struct webgpu_pool_bufs {
     wgpu::Buffer host_buf;
     wgpu::Buffer dev_buf;
+    bool         is_overflow = false;
 };
 
 // The futures to wait on for a single queue submission
@@ -147,6 +151,16 @@ struct webgpu_submission_futures {
 struct webgpu_buf_pool {
     std::vector<webgpu_pool_bufs> free;
 
+    std::atomic<size_t> waiters{ 0 };
+    std::atomic<size_t> overflow_live{ 0 };
+
+    std::atomic<bool> stopping{ false };
+
+    wgpu::Device      device;
+    size_t            buf_size = 0;
+    wgpu::BufferUsage dev_buf_usage;
+    wgpu::BufferUsage host_buf_usage;
+
     std::mutex mutex;
 
     std::condition_variable cv;
@@ -156,18 +170,60 @@ struct webgpu_buf_pool {
               size_t            buf_size,
               wgpu::BufferUsage dev_buf_usage,
               wgpu::BufferUsage host_buf_usage) {
+        this->device         = device;
+        this->buf_size       = buf_size;
+        this->dev_buf_usage  = dev_buf_usage;
+        this->host_buf_usage = host_buf_usage;
+        this->stopping.store(false);
+
         for (int i = 0; i < num_bufs; i++) {
             wgpu::Buffer host_buf;
             wgpu::Buffer dev_buf;
             ggml_webgpu_create_buffer(device, host_buf, buf_size, host_buf_usage, "ggml_webgpu_host_pool_buf");
             ggml_webgpu_create_buffer(device, dev_buf, buf_size, dev_buf_usage, "ggml_webgpu_dev_pool_buf");
-            free.push_back({ host_buf, dev_buf });
+            free.push_back({ host_buf, dev_buf, false });
         }
     }
 
     webgpu_pool_bufs alloc_bufs() {
         std::unique_lock<std::mutex> lock(mutex);
-        cv.wait(lock, [this] { return !free.empty(); });
+        if (free.empty()) {
+            auto t0 = std::chrono::steady_clock::now();
+            waiters.fetch_add(1);
+
+            while (free.empty() && !stopping.load()) {
+                bool woken = cv.wait_for(lock, std::chrono::milliseconds(WEBGPU_POOL_WAIT_SLICE_MS),
+                                         [this] { return !free.empty() || stopping.load(); });
+                if (woken) {
+                    break;
+                }
+
+                auto waited_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+                        .count();
+                if (waited_ms >= WEBGPU_POOL_OVERFLOW_AFTER_MS &&
+                    overflow_live.load() < WEBGPU_POOL_MAX_OVERFLOW_BUFS) {
+                    overflow_live.fetch_add(1);
+                    lock.unlock();
+
+                    wgpu::Buffer host_buf;
+                    wgpu::Buffer dev_buf;
+                    ggml_webgpu_create_buffer(device, host_buf, buf_size, host_buf_usage,
+                                              "ggml_webgpu_host_pool_overflow_buf");
+                    ggml_webgpu_create_buffer(device, dev_buf, buf_size, dev_buf_usage,
+                                              "ggml_webgpu_dev_pool_overflow_buf");
+
+                    waiters.fetch_sub(1);
+                    return { host_buf, dev_buf, true };
+                }
+            }
+
+            waiters.fetch_sub(1);
+
+            if (free.empty()) {
+                GGML_ABORT("ggml_webgpu: parameter buffer pool stopped while waiting for buffers\n");
+            }
+        }
         webgpu_pool_bufs bufs = free.back();
         free.pop_back();
         return bufs;
@@ -175,11 +231,37 @@ struct webgpu_buf_pool {
 
     void free_bufs(std::vector<webgpu_pool_bufs> bufs) {
         std::lock_guard<std::mutex> lock(mutex);
-        free.insert(free.end(), bufs.begin(), bufs.end());
+        size_t                      returned_normal = 0;
+        size_t                      returned_overflow = 0;
+        for (auto & bufs_entry : bufs) {
+            if (bufs_entry.is_overflow) {
+                bufs_entry.host_buf.Destroy();
+                bufs_entry.dev_buf.Destroy();
+                overflow_live.fetch_sub(1);
+                returned_overflow++;
+                continue;
+            }
+            if (stopping.load()) {
+                bufs_entry.host_buf.Destroy();
+                bufs_entry.dev_buf.Destroy();
+                continue;
+            }
+            free.push_back({ bufs_entry.host_buf, bufs_entry.dev_buf, false });
+            returned_normal++;
+        }
+
+        GGML_UNUSED(returned_normal);
+        GGML_UNUSED(returned_overflow);
+        cv.notify_all();
+    }
+
+    void shutdown() {
+        stopping.store(true);
         cv.notify_all();
     }
 
     void cleanup() {
+        shutdown();
         std::lock_guard<std::mutex> lock(mutex);
         for (auto & bufs : free) {
             bufs.host_buf.Destroy();
@@ -497,10 +579,13 @@ static void ggml_backend_webgpu_wait(webgpu_context &                         ct
                 i++;
                 break;
             case wgpu::WaitStatus::Error:
-                GGML_LOG_ERROR("ggml_webgpu: WaitAny returned an error\n");
+                GGML_LOG_ERROR("ggml_webgpu: WaitAny returned an error (idx=%zu, pending=%zu, block=%d)\n", i, futures.size(), block ? 1 : 0);
+                i++;
                 break;
             default:
-                GGML_LOG_ERROR("ggml_webgpu: WaitAny returned an unknown status\n");
+                GGML_LOG_ERROR("ggml_webgpu: WaitAny returned an unknown status=%d (idx=%zu, pending=%zu, block=%d)\n",
+                        (int) waitStatus, i, futures.size(), block ? 1 : 0);
+                i++;
                 break;
         }
     }
@@ -718,6 +803,10 @@ static const char * ggml_backend_webgpu_name(ggml_backend_t backend) {
 static void ggml_backend_webgpu_free(ggml_backend_t backend) {
     ggml_backend_webgpu_context * ctx = (ggml_backend_webgpu_context *) backend->context;
     WEBGPU_LOG_DEBUG("ggml_backend_webgpu_free(" << ctx->name << ")");
+
+    // Ensure pool waiters can always exit during teardown.
+    ctx->webgpu_ctx->param_buf_pool.shutdown();
+    ctx->webgpu_ctx->set_rows_error_buf_pool.shutdown();
 
 #ifdef GGML_WEBGPU_CPU_PROFILE
     std::cout << "\n[ggml_webgpu cpu profiling summary]\n";
@@ -2918,10 +3007,12 @@ static ggml_backend_dev_t ggml_backend_webgpu_reg_get_device(ggml_backend_reg_t 
     dev_desc.requiredFeatureCount = required_features.size();
     dev_desc.SetDeviceLostCallback(
         wgpu::CallbackMode::AllowSpontaneous,
-        [](const wgpu::Device & device, wgpu::DeviceLostReason reason, wgpu::StringView message) {
+        [ctx](const wgpu::Device & device, wgpu::DeviceLostReason reason, wgpu::StringView message) {
             GGML_UNUSED(device);
             GGML_UNUSED(reason);
             GGML_UNUSED(message);
+            ctx->param_buf_pool.shutdown();
+            ctx->set_rows_error_buf_pool.shutdown();
             //TODO: uncomment once proper free logic is in place
             //GGML_LOG_ERROR("ggml_webgpu: Device lost! Reason: %d, Message: %s\n", static_cast<int>(reason),
             //std::string(message).c_str());
